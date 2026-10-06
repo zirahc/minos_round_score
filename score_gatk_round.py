@@ -8,9 +8,9 @@ Tool is always GATK. Config defaults to minos_subnet/configs/gatk.conf.
 This is a local self-scorer: no wallet, no chain, no submission.
 
 Examples:
-  python score_gatk_folders.py
-  python score_gatk_folders.py 2026-09-02T21-44-00+00-00
-  python score_gatk_folders.py --config configs/gatk.conf
+  python score_gatk_round.py
+  python score_gatk_round.py 2026-09-02T21-44-00+00-00
+  python score_gatk_round.py --config configs/gatk.conf
 """
 from __future__ import annotations
 

@@ -59,7 +59,7 @@ ROUNDS_DIR = SUBNET_ROOT / "datasets" / "rounds"
 sys.path.insert(0, str(SUBNET_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
-from score_gatk_folders import (  # noqa: E402
+from score_gatk_round import (  # noqa: E402
     _jsonable,
     _load_gatk_config,
     _print_summary,
