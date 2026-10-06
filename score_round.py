@@ -6,8 +6,10 @@ The round id is the primary key of public.rounds, for example
 files from the row's huggingface link, applies gatk_updates.json on top of
 minos_subnet/configs/gatk.conf, runs GATK, and writes the v2 score.
 
-This folder is the sibling of minos_subnet. Reference FASTA and the GATK
-template come from that checkout. The gatk.conf file on disk is not modified.
+This folder is the sibling of minos_subnet. The GATK template comes from that
+checkout. Before the round download, the chromosome reference (FASTA, index,
+dictionary, and RTG SDF) is checked under minos_subnet/datasets/reference/
+and any missing files are downloaded. The gatk.conf file on disk is not modified.
 
   python score_round.py "2026-09-02T21:44:00+00:00"
   python score_round.py "2026-09-02T21:44:00+00:00" --updates gatk_updates.json
@@ -69,6 +71,23 @@ from templates.tool_params import (  # noqa: E402
 )
 
 GATK_CONF = SUBNET_ROOT / "configs" / "gatk.conf"
+REFERENCE_DIR = SUBNET_ROOT / "datasets" / "reference"
+DEFAULT_REF_BASE = "https://api.theminos.ai/reference"
+# api.theminos.ai/reference rejects the default Python urllib user agent.
+REF_USER_AGENT = "minos-installer/0.1 (+https://github.com/minos-protocol/minos_subnet)"
+FASTA_EXTS = ("fa", "fa.fai", "dict")
+SDF_FILES = (
+    "done",
+    "mainIndex",
+    "nameIndex0",
+    "namedata0",
+    "namepointer0",
+    "progress",
+    "seqdata0",
+    "seqpointer0",
+    "sequenceIndex0",
+    "summary.txt",
+)
 ROUND_COLUMNS = (
     "round_id,region,huggingface,status,"
     "rank_1_tool_name,rank_1_combined_final,rank_1_snp_final,rank_1_indel_final"
@@ -147,10 +166,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  Region:     {region}", flush=True)
     print(f"  Status:     {row.get('status')}", flush=True)
     print(f"  HuggingFace {link}", flush=True)
+    chrom = region.split(":", 1)[0]
     print(f"  GATK base:  {GATK_CONF}", flush=True)
     print(f"  Updates:    {updates_path.name}  ({len(prepared)} config(s))", flush=True)
+    print(f"  Reference:  {REFERENCE_DIR / chrom}", flush=True)
     _print_rank1(row)
     print(flush=True)
+
+    if not ensure_reference(chrom):
+        return 2
 
     try:
         folder = download_round(remote, force=args.force)
@@ -307,6 +331,87 @@ def parse_huggingface_link(url: str) -> Dict[str, str]:
         "revision": parts[3],
         "folder": folder,
     }
+
+
+def ensure_reference(chrom: str) -> bool:
+    """Download FASTA, index, dictionary, and RTG SDF when any file is missing.
+
+    Files land in minos_subnet/datasets/reference/<chrom>/, which is where
+    scoring looks. Files already on disk are left in place.
+    """
+    ref_base = (os.getenv("REF_S3_BASE") or DEFAULT_REF_BASE).rstrip("/")
+    fa_dir = REFERENCE_DIR / chrom
+    sdf_dir = fa_dir / f"{chrom}.sdf"
+    fasta_files = [fa_dir / f"{chrom}.{ext}" for ext in FASTA_EXTS]
+    sdf_files = [sdf_dir / name for name in SDF_FILES]
+    missing = [path for path in fasta_files + sdf_files if not _file_ready(path)]
+    if not missing:
+        print(f"  Reference {chrom} already present", flush=True)
+        return True
+
+    print(f"  Reference {chrom} is missing {len(missing)} file(s). Downloading them first.", flush=True)
+    fa_dir.mkdir(parents=True, exist_ok=True)
+    for path in fasta_files:
+        if _file_ready(path):
+            print(f"    reuse {path.name}", flush=True)
+            continue
+        if not _download_ref_file(f"{ref_base}/{chrom}/{path.name}", path):
+            print(f"  ERROR: could not download {path.name}", flush=True)
+            return False
+    if any(not _file_ready(path) for path in sdf_files):
+        sdf_dir.mkdir(parents=True, exist_ok=True)
+        for path in sdf_files:
+            if _file_ready(path):
+                print(f"    reuse {chrom}.sdf/{path.name}", flush=True)
+                continue
+            url = f"{ref_base}/{chrom}/{chrom}.sdf/{path.name}"
+            if not _download_ref_file(url, path):
+                print(f"  ERROR: could not download {chrom}.sdf/{path.name}", flush=True)
+                return False
+    print(f"  Reference {chrom} ready", flush=True)
+    return True
+
+
+def _file_ready(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _download_ref_file(url: str, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    request = urllib.request.Request(url, headers={"User-Agent": REF_USER_AGENT})
+    written = 0
+    next_report = 32 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            if not (200 <= response.status < 300):
+                return False
+            with tmp.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    written += len(chunk)
+                    if written >= next_report:
+                        print(f"    {dest.name}: {written / (1024 * 1024):.0f} MB", flush=True)
+                        next_report += 32 * 1024 * 1024
+        if written <= 0:
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(dest)
+        print(f"    {dest.name}: {written / (1024 * 1024):.1f} MB", flush=True)
+        return True
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"    ERROR: {url} ({exc})", flush=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def download_round(remote: Dict[str, str], force: bool) -> Path:
