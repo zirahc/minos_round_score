@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Run GATK on every practice round folder and print a v2 validator-style score.
+"""Run GATK on the one downloaded round and print a v2 validator-style score.
 
-Looks in datasets/practice/ and scores each round subdirectory that already
-contains a BAM, a truth VCF, and a mutations VCF. Tool is always GATK.
-Config defaults to configs/gatk.conf.
+Scores the round directory score_round.py last wrote under
+minos_subnet/datasets/rounds/. Pass a folder to score a different download.
+Tool is always GATK. Config defaults to minos_subnet/configs/gatk.conf.
 
 This is a local self-scorer: no wallet, no chain, no submission.
 
 Examples:
   python score_gatk_folders.py
+  python score_gatk_folders.py 2026-09-02T21-44-00+00-00
   python score_gatk_folders.py --config configs/gatk.conf
 """
 from __future__ import annotations
@@ -51,24 +52,22 @@ from utils.scoring import (
     parse_happy_vcf,
 )
 
-PRACTICE_DIR = REPO_ROOT / "datasets" / "practice"
+PRACTICE_DIR = SUBNET_ROOT / "datasets" / "rounds"
 SKIP_ROUNDS = frozenset({"round_2aeeddc1d86288f3"})
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "gatk.conf"
+DEFAULT_CONFIG = SUBNET_ROOT / "configs" / "gatk.conf"
 SAMTOOLS_IMAGE = "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
 REGION_PADDING = 100_000
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    practice_dir = Path(args.practice_dir).resolve() if args.practice_dir else PRACTICE_DIR
-    folders, skipped = _list_round_folders(practice_dir)
-    if folders is None:
+    rounds_dir = Path(args.practice_dir).resolve() if args.practice_dir else PRACTICE_DIR
+    folder = _resolve_downloaded_round(args.folder, rounds_dir)
+    if folder is None:
         return 2
-    if not folders:
-        print(
-            f"ERROR: no round folders with BAM + truth + mutations under {practice_dir}",
-            flush=True,
-        )
+    files = _discover_files(folder)
+    if files.get("error"):
+        print(f"ERROR: {files['error']}", flush=True)
         return 2
 
     try:
@@ -88,43 +87,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("  GATK LOCAL FOLDER SCORER  (v2 only)", flush=True)
     print("=" * 72, flush=True)
     print(f"  Config:           {args.config}  ({n_params} params)", flush=True)
-    print(f"  Practice dir:     {practice_dir}", flush=True)
-    print(f"  Rounds:           {len(folders)}", flush=True)
-    if skipped:
-        print(f"  Skipped:          {len(skipped)} incomplete subfolder(s)", flush=True)
-        for name in skipped:
-            print(f"                    - {name}", flush=True)
+    print(f"  Round:            {folder}", flush=True)
     print(flush=True)
 
-    results: List[Dict[str, Any]] = []
-    for i, folder in enumerate(folders, 1):
-        print(f"\n{'#' * 72}", flush=True)
-        print(f"  [{i}/{len(folders)}] {folder}", flush=True)
-        print(f"{'#' * 72}", flush=True)
-        result = score_folder(
-            folder=folder,
-            tool_config=tool_config,
-            region_override=args.region,
-            region_padding=args.region_padding,
-        )
-        results.append(result)
-
-    _print_summary(results)
+    result = score_folder(
+        folder=folder,
+        tool_config=tool_config,
+        region_override=args.region,
+        region_padding=args.region_padding,
+    )
+    _print_summary([result])
     if args.json_out:
-        _write_json(Path(args.json_out), [_v2_save_payload(r) for r in results])
+        _write_json(Path(args.json_out), [_v2_save_payload(result)])
 
-    failed = sum(1 for r in results if not r.get("ok"))
-    return 1 if failed else 0
+    return 0 if result.get("ok") else 1
 
 
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run GATK on every round under datasets/practice and print the v2 score.",
+        description="Run GATK on the one downloaded round and print the v2 score.",
+    )
+    p.add_argument(
+        "folder",
+        nargs="?",
+        default=None,
+        help="Round directory or its name under datasets/rounds. "
+             "Defaults to the round score_round.py last downloaded.",
     )
     p.add_argument(
         "--practice-dir",
         default=str(PRACTICE_DIR),
-        help="Parent folder that contains round_* sample directories "
+        help="Parent folder that contains downloaded rounds "
              f"(default: {PRACTICE_DIR})",
     )
     p.add_argument(
@@ -135,7 +128,7 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument(
         "--region",
         default=None,
-        help="Override region for every folder, e.g. chr20:45000000-50000000. "
+        help="Override the round region, e.g. chr20:45000000-50000000. "
              "Otherwise read region.txt / sample.json, or infer from the mutations VCF.",
     )
     p.add_argument(
@@ -148,7 +141,7 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument(
         "--json-out",
         default=None,
-        help="Write the v2 scores for every folder to this JSON file.",
+        help="Write the v2 score for this round to this JSON file.",
     )
     return p.parse_args(argv)
 
@@ -310,6 +303,41 @@ def score_folder(
     _print_v2_score(detailed)
     _write_json(out_dir / "score_details.json", _v2_save_payload(record))
     return record
+
+
+def _resolve_downloaded_round(raw: Optional[str], rounds_dir: Path) -> Optional[Path]:
+    """The folder argument, or the round recorded in datasets/rounds/.latest."""
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            named = rounds_dir / raw
+            path = named if named.exists() else Path(raw)
+        path = path.resolve()
+        if not path.is_dir():
+            print(f"ERROR: round folder not found: {path}", flush=True)
+            return None
+        return path
+
+    marker = rounds_dir / ".latest"
+    if not marker.is_file():
+        print(
+            f"ERROR: no downloaded round recorded at {marker}. "
+            "Run score_round.py first, or pass the round folder.",
+            flush=True,
+        )
+        return None
+    text = marker.read_text(encoding="utf-8").strip()
+    if not text:
+        print(f"ERROR: {marker} is empty.", flush=True)
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = rounds_dir / text
+    path = path.resolve()
+    if not path.is_dir():
+        print(f"ERROR: downloaded round folder not found: {path}", flush=True)
+        return None
+    return path
 
 
 def _list_round_folders(practice_dir: Path) -> Tuple[Optional[List[Path]], List[str]]:

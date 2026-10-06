@@ -3,7 +3,8 @@
 
 The round id is the primary key of public.rounds, for example
 2026-09-02T21:44:00+00:00. This script reads that row, downloads the reveal
-files from the row's huggingface link, applies gatk_updates.json on top of
+files from the row's huggingface link into minos_subnet/datasets/rounds/,
+applies gatk_updates.json on top of
 minos_subnet/configs/gatk.conf, runs GATK, and writes the v2 score.
 
 This folder is the sibling of minos_subnet. The GATK template comes from that
@@ -39,7 +40,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent
-DOWNLOADS = REPO_ROOT / "downloads"
 RESULTS = REPO_ROOT / "results"
 ENV_PATH = REPO_ROOT / ".env"
 COLLECTOR_ENV = REPO_ROOT.parent / "minos_round_collector" / ".env"
@@ -55,6 +55,7 @@ if not SUBNET_ROOT.is_dir():
     print("This folder must sit next to minos_subnet, or set MINOS_SUBNET.", flush=True)
     raise SystemExit(2)
 
+ROUNDS_DIR = SUBNET_ROOT / "datasets" / "rounds"
 sys.path.insert(0, str(SUBNET_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -182,6 +183,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: download failed: {exc}", flush=True)
         return 2
     (folder / "region.txt").write_text(region + "\n", encoding="utf-8")
+    (ROUNDS_DIR / ".latest").write_text(folder.name + "\n", encoding="utf-8")
     print(f"  Folder:     {folder}", flush=True)
 
     out_path = Path(args.json_out) if args.json_out else RESULTS / f"{remote['folder']}.json"
@@ -415,7 +417,7 @@ def _download_ref_file(url: str, dest: Path) -> bool:
 
 
 def download_round(remote: Dict[str, str], force: bool) -> Path:
-    """Download the reveal files into downloads/<folder>/. Reuse complete files."""
+    """Download the reveal files into minos_subnet/datasets/rounds/<folder>/."""
     try:
         from huggingface_hub import hf_hub_download, list_repo_files
     except ImportError as exc:
@@ -424,7 +426,7 @@ def download_round(remote: Dict[str, str], force: bool) -> Path:
         ) from exc
 
     folder_name = remote["folder"]
-    local = DOWNLOADS / folder_name
+    local = ROUNDS_DIR / folder_name
     local.mkdir(parents=True, exist_ok=True)
     token = os.environ.get("HF_TOKEN") or None
     filenames = list_repo_files(
@@ -456,7 +458,7 @@ def download_round(remote: Dict[str, str], force: bool) -> Path:
             repo_type=remote["repo_type"],
             revision=remote["revision"],
             token=token,
-            local_dir=str(DOWNLOADS),
+            local_dir=str(ROUNDS_DIR),
             force_download=force,
         )
         if not destination.is_file() or destination.stat().st_size == 0:
